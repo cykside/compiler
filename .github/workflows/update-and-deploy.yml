@@ -12,7 +12,7 @@ name: Update Clan Dashboard
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -203,4 +203,6 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow enable "${{ github.workflow }}" --repo "$GITHUB_REPOSITORY"
+        # Memakai API langsung. `gh workflow enable` menolak workflow yang sudah aktif
+        # ("could not find any workflows named ...").
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/enable"

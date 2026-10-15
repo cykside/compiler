@@ -1,0 +1,206 @@
+name: Update Clan Dashboard
+
+# Letakkan file ini di REPO PUBLIK sebagai .github/workflows/update-and-deploy.yml
+# Kode proyek tetap di repo privat; repo publik hanya menjalankan Actions (menit gratis).
+#
+# Secrets yang dibutuhkan di repo PUBLIK (Settings > Secrets and variables > Actions):
+#   COC_API_KEY, PRIVATE_REPO_TOKEN, TARGET_REPO_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Variable (opsional): COC_API_BASE, TELEGRAM_NOTIFY_SUCCESS
+#
+# JANGAN tambahkan trigger pull_request / pull_request_target / issue_comment di workflow ini:
+# repo publik bisa dibuka siapa saja.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # hanya untuk langkah keepalive di akhir
+
+concurrency:
+  group: clan-dashboard
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: cykside/cunyuk-of-war   # repo privat berisi kode proyek
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: project
+    env:
+      TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout private project
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: project
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: project/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run collector and build dashboard
+        env:
+          COC_API_KEY: ${{ secrets.COC_API_KEY }}
+          COC_API_BASE: ${{ vars.COC_API_BASE }}
+        run: |
+          python coc_clan.py --once --clans "#2JVQVYUYC" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
+          python clan_dashboard.py --snapshot clan_snapshot.json --out docs
+
+      - name: Verify generated files
+        run: |
+          test -f docs/index.html
+          python - <<'EOF'
+          import json, sys
+          d = json.load(open("docs/data.json", encoding="utf-8"))
+          clans = d.get("clans") or {}
+          if not any((c or {}).get("memberList") for c in clans.values()):
+              sys.exit("data.json tidak berisi anggota klan")
+          print("OK:", ", ".join((c or {}).get("name", "?") for c in clans.values()))
+          EOF
+
+      # State (snapshot + history) disimpan balik ke repo PRIVAT lewat token checkout.
+      - name: Save snapshot and history (private repo)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add clan_snapshot.json clan_history.jsonl
+          if git diff --cached --quiet; then
+            echo "Tidak ada perubahan state."
+          else
+            git commit -m "chore: update clan state [skip ci]"
+            git push
+          fi
+
+      - name: Deploy to cykside/coc-web
+        if: ${{ env.TARGET_REPO_TOKEN != '' }}
+        run: |
+          set -e
+          rm -rf /tmp/coc-web && mkdir -p /tmp/coc-web
+          git clone "https://x-access-token:${TARGET_REPO_TOKEN}@github.com/cykside/coc-web.git" /tmp/coc-web
+          cd /tmp/coc-web
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git checkout gh-pages
+          else
+            git checkout --orphan gh-pages
+          fi
+
+          find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+          # "/." ikut menyalin file tersembunyi (.nojekyll)
+          cp -R "$GITHUB_WORKSPACE"/project/docs/. .
+
+          git add --all
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Deploy dashboard from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+            git push origin gh-pages
+          fi
+
+      # ---------- Notifikasi Telegram ----------
+      - name: Telegram - success
+        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' && vars.TELEGRAM_NOTIFY_SUCCESS != 'false' }}
+        continue-on-error: true
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'EOF'
+          import json, os
+          from datetime import datetime, timedelta, timezone
+
+          d = json.load(open("docs/data.json", encoding="utf-8"))
+          WIB = timezone(timedelta(hours=7))
+
+          def wib(v):
+              try:
+                  dt = datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+                  return dt.astimezone(WIB).strftime("%d/%m %H:%M WIB")
+              except Exception:
+                  return "-"
+
+          lines = ["✅ Dashboard klan diperbarui"]
+          for key, c in (d.get("clans") or {}).items():
+              c = c or {}
+              lines.append(f"{c.get('name')} · {c.get('memberCount')} anggota · {c.get('points')} poin")
+              w = (d.get("wars") or {}).get(key) or {}
+              st = {"preparation": "persiapan", "inWar": "sedang berlangsung", "warEnded": "selesai"}.get(w.get("state"))
+              if st:
+                  us, them = w.get("us") or {}, w.get("them") or {}
+                  if w.get("state") == "preparation":
+                      extra = f"mulai {wib(w.get('start'))}"
+                  else:
+                      extra = f"{us.get('stars', 0)}★ vs {them.get('stars', 0)}★"
+                  lines.append(f"War vs {them.get('name', '?')}: {st}, {extra}")
+              else:
+                  lines.append("War: tidak ada")
+              diffs = ((d.get("meta") or {}).get(key) or {}).get("diffs") or []
+              ch = [x for x in diffs if not x.startswith("Snapshot baru")]
+              if ch:
+                  lines.append(f"Perubahan ({len(ch)}):")
+                  lines += ["• " + x for x in ch[:5]]
+                  if len(ch) > 5:
+                      lines.append(f"…dan {len(ch) - 5} lainnya")
+          lines.append(f"Pemicu: {os.environ['EVENT']} · run #{os.environ['RUN_NUMBER']}")
+          lines.append(os.environ["RUN_URL"])
+          open("/tmp/tg_msg.txt", "w", encoding="utf-8").write("\n".join(lines))
+          EOF
+
+          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@/tmp/tg_msg.txt" \
+            -d "disable_notification=true" \
+            -d "disable_web_page_preview=true" >/dev/null
+
+      - name: Telegram - failed
+        if: ${{ failure() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        continue-on-error: true
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '%s\n' \
+            "❌ Workflow dashboard klan GAGAL" \
+            "Pemicu: ${EVENT} · run #${RUN_NUMBER}" \
+            "Buka log untuk melihat langkah yang gagal (kemungkinan: API key/IP ditolak, atau token repo kedaluwarsa)." \
+            "${RUN_URL}" > /tmp/tg_msg.txt
+          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text@/tmp/tg_msg.txt" \
+            -d "disable_web_page_preview=true" >/dev/null
+
+      # Repo publik tanpa aktivitas ~60 hari: GitHub menonaktifkan jadwalnya. Karena commit state
+      # masuk ke repo PRIVAT, repo publik ini tidak punya aktivitas sendiri. Langkah ini mengaktifkan
+      # ulang workflow lewat API supaya jadwal tetap hidup.
+      - name: Keep schedule alive
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable "${{ github.workflow }}" --repo "$GITHUB_REPOSITORY"

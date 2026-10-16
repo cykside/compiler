@@ -63,7 +63,7 @@ jobs:
           COC_API_KEY: ${{ secrets.COC_API_KEY }}
           COC_API_BASE: ${{ vars.COC_API_BASE }}
         run: |
-          python coc_clan.py --once --clans "#2JVQVYUYC,#2RJRRG8YQ" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
+          python coc_clan.py --once --clans "#2JVQVYUYC" "#2RJRRG8YQ" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
           python clan_dashboard.py --snapshot clan_snapshot.json --out docs
 
       - name: Verify generated files

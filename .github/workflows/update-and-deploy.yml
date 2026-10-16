@@ -205,8 +205,13 @@ jobs:
             echo "Tidak ada perubahan state."
           else
             git commit -m "chore: update clan state [skip ci]"
-            git pull --rebase
-            git push
+            ok=0
+            for i in 1 2 3; do
+              if git pull --rebase --autostash && git push; then ok=1; break; fi
+              echo "Percobaan $i gagal, mengulang..."
+              sleep 5
+            done
+            [ "$ok" = 1 ]
           fi
 
       - name: Deploy to cykside/coc-web

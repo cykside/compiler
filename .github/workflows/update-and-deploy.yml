@@ -5,7 +5,13 @@ name: Update Clan Dashboard
 #
 # Secrets yang dibutuhkan di repo PUBLIK (Settings > Secrets and variables > Actions):
 #   COC_API_KEY, PRIVATE_REPO_TOKEN, TARGET_REPO_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-# Variable (opsional): COC_API_BASE, TELEGRAM_NOTIFY_SUCCESS
+# Variable (opsional): COC_API_BASE
+#
+# Notifikasi Telegram hanya untuk hal penting:
+#   - war baru / war mulai / hasil war
+#   - pengingat 2 jam dan 30 menit sebelum war berakhir (yang belum menyerang)
+#   - perubahan penting klan (masuk/keluar/role/naik TH-liga-level)
+#   - gagal (hanya kegagalan pertama dalam satu rentetan) dan pulih
 #
 # JANGAN tambahkan trigger pull_request / pull_request_target / issue_comment di workflow ini:
 # repo publik bisa dibuka siapa saja.
@@ -17,7 +23,7 @@ on:
 
 permissions:
   contents: read
-  actions: write   # hanya untuk langkah keepalive di akhir
+  actions: write   # untuk langkah keepalive dan membaca riwayat run
 
 concurrency:
   group: clan-dashboard
@@ -29,6 +35,7 @@ env:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: project
@@ -78,16 +85,127 @@ jobs:
           print("OK:", ", ".join((c or {}).get("name", "?") for c in clans.values()))
           EOF
 
-      # State (snapshot + history) disimpan balik ke repo PRIVAT lewat token checkout.
+      # ---------- Notifikasi Telegram: hanya hal penting ----------
+      # Status (agar tiap kejadian dikirim sekali) disimpan di notify_state.json
+      # dan ikut di-commit ke repo privat oleh langkah berikutnya.
+      # Run pertama hanya mencatat kondisi awal tanpa mengirim pesan.
+      - name: Telegram - notifikasi penting
+        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        continue-on-error: true
+        run: |
+          python - <<'EOF'
+          import json, os, urllib.parse, urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          WIB = timezone(timedelta(hours=7))
+          STATE_FILE = "notify_state.json"
+          REMIND_AT = [7200, 1800]  # detik sebelum war berakhir
+          # kata kunci perubahan yang dianggap penting (sesuaikan dengan teks diffs kamu)
+          IMPORTANT = ("masuk", "keluar", "bergabung", "role", "naik th", "naik liga", "level klan")
+
+          def parse(v):
+              try:
+                  return datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+              except Exception:
+                  return None
+
+          def wib(v):
+              dt = parse(v or "")
+              return dt.astimezone(WIB).strftime("%d/%m %H:%M WIB") if dt else "-"
+
+          d = json.load(open("docs/data.json", encoding="utf-8"))
+          first_run = not os.path.exists(STATE_FILE)
+          state = {} if first_run else json.load(open(STATE_FILE, encoding="utf-8"))
+          state.setdefault("wars", {})
+          state.setdefault("last_diffs", {})
+          now = datetime.now(timezone.utc)
+          msgs = []
+
+          for key, c in (d.get("clans") or {}).items():
+              c = c or {}
+              name = c.get("name") or key
+              w = (d.get("wars") or {}).get(key) or {}
+              us, them = w.get("us") or {}, w.get("them") or {}
+              cur = {"state": w.get("state") or "none", "id": w.get("start") or "", "reminded": []}
+              prev = state["wars"].get(key)
+
+              if prev and cur["state"] != "none":
+                  changed = prev.get("state") != cur["state"] or prev.get("id") != cur["id"]
+                  if prev.get("id") == cur["id"]:
+                      cur["reminded"] = prev.get("reminded", [])
+                  if changed:
+                      lawan = them.get("name", "?")
+                      if cur["state"] == "preparation":
+                          msgs.append(f"⚔️ {name}: war baru vs {lawan}, mulai {wib(w.get('start'))}")
+                      elif cur["state"] == "inWar":
+                          msgs.append(f"🔥 {name}: war vs {lawan} dimulai, berakhir {wib(w.get('end'))}")
+                      elif cur["state"] == "warEnded":
+                          a, b = us.get("stars", 0), them.get("stars", 0)
+                          if a == b:
+                              da, db = us.get("destructionPercentage"), them.get("destructionPercentage")
+                              if da is not None and db is not None and da != db:
+                                  a, b = da, db
+                          hasil = "MENANG 🏆" if a > b else "KALAH 😞" if a < b else "SERI 🤝"
+                          msgs.append(f"{name}: war vs {lawan} selesai, {hasil} ({us.get('stars', 0)}★ vs {them.get('stars', 0)}★)")
+              elif prev and prev.get("id") == cur["id"]:
+                  cur["reminded"] = prev.get("reminded", [])
+
+              # pengingat serangan belum dipakai
+              end = parse(w.get("end") or "")
+              if prev and cur["state"] == "inWar" and end:
+                  remain = (end - now).total_seconds()
+                  due = [t for t in REMIND_AT if remain <= t and t not in cur["reminded"]]
+                  if due:
+                      per = w.get("attacksPerMember", 2)
+                      belum = []
+                      for m in us.get("members") or []:
+                          if "attacks" in m:
+                              sisa = per - len(m.get("attacks") or [])
+                              if sisa > 0:
+                                  belum.append(f"{m.get('name', '?')} ({sisa})")
+                      if belum:
+                          jam = int(remain // 3600)
+                          menit = int((remain % 3600) // 60)
+                          msgs.append(f"⏰ {name}: war berakhir {jam}j {menit}m lagi. Belum menyerang: " + ", ".join(belum[:15]))
+                      cur["reminded"] = sorted(set(cur["reminded"]) | {t for t in REMIND_AT if remain <= t})
+
+              state["wars"][key] = cur
+
+              # perubahan penting (hanya yang baru dibanding run sebelumnya)
+              diffs = ((d.get("meta") or {}).get(key) or {}).get("diffs") or []
+              diffs = [x for x in diffs if not x.startswith("Snapshot baru")]
+              baru = [x for x in diffs if x not in state["last_diffs"].get(key, [])]
+              penting = [x for x in baru if any(k in x.lower() for k in IMPORTANT)]
+              if penting and not first_run:
+                  msgs.append(f"📋 {name}:\n" + "\n".join("• " + x for x in penting[:8]))
+              state["last_diffs"][key] = diffs
+
+          if msgs and not first_run:
+              body = urllib.parse.urlencode({
+                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                  "text": "\n\n".join(msgs)[:4000],
+                  "disable_web_page_preview": "true",
+              }).encode()
+              url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
+              urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=20).read()
+
+          json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1, sort_keys=True)
+          print("Notifikasi terkirim:", len(msgs))
+          EOF
+
+      # State (snapshot + history + notifikasi) disimpan balik ke repo PRIVAT lewat token checkout.
       - name: Save snapshot and history (private repo)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add clan_snapshot.json clan_history.jsonl
+          for f in clan_snapshot.json clan_history.jsonl notify_state.json; do
+            [ -f "$f" ] && git add "$f"
+          done
           if git diff --cached --quiet; then
             echo "Tidak ada perubahan state."
           else
             git commit -m "chore: update clan state [skip ci]"
+            git pull --rebase
             git push
           fi
 
@@ -121,79 +239,42 @@ jobs:
             git push origin gh-pages
           fi
 
-      # ---------- Notifikasi Telegram ----------
-      - name: Telegram - success
-        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' && vars.TELEGRAM_NOTIFY_SUCCESS != 'false' }}
-        continue-on-error: true
-        env:
-          EVENT: ${{ github.event_name }}
-          RUN_NUMBER: ${{ github.run_number }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          python - <<'EOF'
-          import json, os
-          from datetime import datetime, timedelta, timezone
-
-          d = json.load(open("docs/data.json", encoding="utf-8"))
-          WIB = timezone(timedelta(hours=7))
-
-          def wib(v):
-              try:
-                  dt = datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-                  return dt.astimezone(WIB).strftime("%d/%m %H:%M WIB")
-              except Exception:
-                  return "-"
-
-          lines = ["✅ Dashboard klan diperbarui"]
-          for key, c in (d.get("clans") or {}).items():
-              c = c or {}
-              lines.append(f"{c.get('name')} · {c.get('memberCount')} anggota · {c.get('points')} poin")
-              w = (d.get("wars") or {}).get(key) or {}
-              st = {"preparation": "persiapan", "inWar": "sedang berlangsung", "warEnded": "selesai"}.get(w.get("state"))
-              if st:
-                  us, them = w.get("us") or {}, w.get("them") or {}
-                  if w.get("state") == "preparation":
-                      extra = f"mulai {wib(w.get('start'))}"
-                  else:
-                      extra = f"{us.get('stars', 0)}★ vs {them.get('stars', 0)}★"
-                  lines.append(f"War vs {them.get('name', '?')}: {st}, {extra}")
-              else:
-                  lines.append("War: tidak ada")
-              diffs = ((d.get("meta") or {}).get(key) or {}).get("diffs") or []
-              ch = [x for x in diffs if not x.startswith("Snapshot baru")]
-              if ch:
-                  lines.append(f"Perubahan ({len(ch)}):")
-                  lines += ["• " + x for x in ch[:5]]
-                  if len(ch) > 5:
-                      lines.append(f"…dan {len(ch) - 5} lainnya")
-          lines.append(f"Pemicu: {os.environ['EVENT']} · run #{os.environ['RUN_NUMBER']}")
-          lines.append(os.environ["RUN_URL"])
-          open("/tmp/tg_msg.txt", "w", encoding="utf-8").write("\n".join(lines))
-          EOF
-
-          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text@/tmp/tg_msg.txt" \
-            -d "disable_notification=true" \
-            -d "disable_web_page_preview=true" >/dev/null
-
-      - name: Telegram - failed
+      # ---------- Notifikasi gagal / pulih ----------
+      - name: Telegram - failed (hanya kegagalan pertama)
         if: ${{ failure() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         continue-on-error: true
         env:
-          EVENT: ${{ github.event_name }}
-          RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/runs?status=completed&per_page=1" --jq '.workflow_runs[0].conclusion')
+          if [ "$prev" = "failure" ]; then
+            echo "Sudah diberi tahu pada kegagalan sebelumnya."
+            exit 0
+          fi
           printf '%s\n' \
             "❌ Workflow dashboard klan GAGAL" \
-            "Pemicu: ${EVENT} · run #${RUN_NUMBER}" \
-            "Buka log untuk melihat langkah yang gagal (kemungkinan: API key/IP ditolak, atau token repo kedaluwarsa)." \
+            "Kemungkinan: API key/IP ditolak, tag klan salah, atau token repo kedaluwarsa." \
+            "Pesan berikutnya ditahan sampai berhasil lagi." \
             "${RUN_URL}" > /tmp/tg_msg.txt
           curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text@/tmp/tg_msg.txt" \
             -d "disable_web_page_preview=true" >/dev/null
+
+      - name: Telegram - pulih
+        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/runs?status=completed&per_page=1" --jq '.workflow_runs[0].conclusion')
+          if [ "$prev" = "failure" ]; then
+            curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=✅ Dashboard klan berjalan normal lagi" \
+              -d "disable_notification=true" >/dev/null
+          fi
 
       # Repo publik tanpa aktivitas ~60 hari: GitHub menonaktifkan jadwalnya. Karena commit state
       # masuk ke repo PRIVAT, repo publik ini tidak punya aktivitas sendiri. Langkah ini mengaktifkan

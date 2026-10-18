@@ -3,6 +3,9 @@ name: Update Clan Dashboard
 # Letakkan file ini di REPO PUBLIK sebagai .github/workflows/update-and-deploy.yml
 # Kode proyek tetap di repo privat; repo publik hanya menjalankan Actions (menit gratis).
 #
+# Repo privat harus berisi: coc_clan.py, clan_dashboard.py, clan_dashboard_template_adv.html,
+# requirements.txt, dan folder assets/ (style.css, app.js, favicon, ikon, manifest).
+#
 # Secrets yang dibutuhkan di repo PUBLIK (Settings > Secrets and variables > Actions):
 #   COC_API_KEY, PRIVATE_REPO_TOKEN, TARGET_REPO_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # Variable (opsional): COC_API_BASE
@@ -10,7 +13,7 @@ name: Update Clan Dashboard
 # Notifikasi Telegram hanya untuk hal penting:
 #   - war baru / war mulai / hasil war
 #   - pengingat 2 jam dan 30 menit sebelum war berakhir (yang belum menyerang)
-#   - perubahan penting klan (masuk/keluar/role/naik TH-liga-level)
+#   - perubahan penting klan (masuk/keluar/role/naik TH)
 #   - gagal (hanya kegagalan pertama dalam satu rentetan) dan pulih
 #
 # JANGAN tambahkan trigger pull_request / pull_request_target / issue_comment di workflow ini:
@@ -76,6 +79,9 @@ jobs:
       - name: Verify generated files
         run: |
           test -f docs/index.html
+          test -f docs/assets/style.css
+          test -f docs/assets/app.js
+          test -f docs/assets/manifest.webmanifest
           python - <<'EOF'
           import json, sys
           d = json.load(open("docs/data.json", encoding="utf-8"))
@@ -100,8 +106,15 @@ jobs:
           WIB = timezone(timedelta(hours=7))
           STATE_FILE = "notify_state.json"
           REMIND_AT = [7200, 1800]  # detik sebelum war berakhir
-          # kata kunci perubahan yang dianggap penting (sesuaikan dengan teks diffs kamu)
-          IMPORTANT = ("masuk", "keluar", "bergabung", "role", "naik th", "naik liga", "level klan")
+
+          # Awalan diff yang ditulis coc_clan.py (diff_clan): JOIN, LEFT, ROLE, TH, DON, CAP.
+          # DON dan CAP terlalu sering, jadi tidak dinotifikasikan.
+          LABEL = {"JOIN": "➕ Masuk", "LEFT": "➖ Keluar", "ROLE": "🎖️ Role", "TH": "🏰 Naik TH"}
+          IMPORTANT = tuple(k + ":" for k in LABEL)
+
+          def fmt_diff(x):
+              k, _, rest = x.partition(":")
+              return f"{LABEL.get(k, k)}:{rest}"
 
           def parse(v):
               try:
@@ -142,7 +155,8 @@ jobs:
                       elif cur["state"] == "warEnded":
                           a, b = us.get("stars", 0), them.get("stars", 0)
                           if a == b:
-                              da, db = us.get("destructionPercentage"), them.get("destructionPercentage")
+                              # bintang sama: pemenang ditentukan persentase kerusakan (field "pct")
+                              da, db = us.get("pct"), them.get("pct")
                               if da is not None and db is not None and da != db:
                                   a, b = da, db
                           hasil = "MENANG 🏆" if a > b else "KALAH 😞" if a < b else "SERI 🤝"
@@ -156,7 +170,7 @@ jobs:
                   remain = (end - now).total_seconds()
                   due = [t for t in REMIND_AT if remain <= t and t not in cur["reminded"]]
                   if due:
-                      per = w.get("attacksPerMember", 2)
+                      per = w.get("perMember") or 2   # jatah serangan per anggota
                       belum = []
                       for m in us.get("members") or []:
                           if "attacks" in m:
@@ -175,9 +189,9 @@ jobs:
               diffs = ((d.get("meta") or {}).get(key) or {}).get("diffs") or []
               diffs = [x for x in diffs if not x.startswith("Snapshot baru")]
               baru = [x for x in diffs if x not in state["last_diffs"].get(key, [])]
-              penting = [x for x in baru if any(k in x.lower() for k in IMPORTANT)]
+              penting = [x for x in baru if x.startswith(IMPORTANT)]
               if penting and not first_run:
-                  msgs.append(f"📋 {name}:\n" + "\n".join("• " + x for x in penting[:8]))
+                  msgs.append(f"📋 {name}:\n" + "\n".join("• " + fmt_diff(x) for x in penting[:8]))
               state["last_diffs"][key] = diffs
 
           if msgs and not first_run:
@@ -233,7 +247,7 @@ jobs:
 
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
 
-          # "/." ikut menyalin file tersembunyi (.nojekyll)
+          # "/." ikut menyalin file tersembunyi (.nojekyll) dan subfolder assets/
           cp -R "$GITHUB_WORKSPACE"/project/docs/. .
 
           git add --all
@@ -259,7 +273,7 @@ jobs:
           fi
           printf '%s\n' \
             "❌ Workflow dashboard klan GAGAL" \
-            "Kemungkinan: API key/IP ditolak, tag klan salah, atau token repo kedaluwarsa." \
+            "Kemungkinan: API key/IP ditolak, tag klan salah, folder assets/ belum ada di repo privat, atau token repo kedaluwarsa." \
             "Pesan berikutnya ditahan sampai berhasil lagi." \
             "${RUN_URL}" > /tmp/tg_msg.txt
           curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

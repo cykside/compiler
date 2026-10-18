@@ -1,21 +1,5 @@
 name: Update Clan Dashboard
 
-# Letakkan file ini di REPO PUBLIK sebagai .github/workflows/update-and-deploy.yml
-# Kode proyek tetap di repo privat; repo publik hanya menjalankan Actions (menit gratis).
-#
-# Secrets yang dibutuhkan di repo PUBLIK (Settings > Secrets and variables > Actions):
-#   COC_API_KEY, PRIVATE_REPO_TOKEN, TARGET_REPO_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-# Variable (opsional): COC_API_BASE
-#
-# Notifikasi Telegram hanya untuk hal penting:
-#   - war baru / war mulai / hasil war
-#   - pengingat 2 jam dan 30 menit sebelum war berakhir (yang belum menyerang)
-#   - perubahan penting klan (masuk/keluar/role/naik TH-liga-level)
-#   - gagal (hanya kegagalan pertama dalam satu rentetan) dan pulih
-#
-# JANGAN tambahkan trigger pull_request / pull_request_target / issue_comment di workflow ini:
-# repo publik bisa dibuka siapa saja.
-
 on:
   schedule:
     - cron: '*/5 * * * *'
@@ -23,26 +7,16 @@ on:
 
 permissions:
   contents: read
-  actions: write   # untuk langkah keepalive dan membaca riwayat run
-
-concurrency:
-  group: clan-dashboard
-  cancel-in-progress: false
 
 env:
-  PRIVATE_REPO: cykside/cunyuk-of-war   # repo privat berisi kode proyek
+  PRIVATE_REPO: cykside/cunyuk-of-war
+  TARGET_REPO: cykside/coc-web
+  TARGET_BRANCH: gh-pages   # <-- sesuaikan: gh-pages atau main
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: project
-    env:
-      TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout private project
@@ -53,242 +27,71 @@ jobs:
           path: project
           persist-credentials: true
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
-          cache-dependency-path: project/requirements.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+        working-directory: project
 
-      - name: Run collector and build dashboard
+      - name: Build dashboard
         env:
           COC_API_KEY: ${{ secrets.COC_API_KEY }}
           COC_API_BASE: ${{ vars.COC_API_BASE }}
         run: |
-          python coc_clan.py --once --clans "#2JVQVYUYC" "#2RJRRG8YQ" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
+          python coc_clan.py --once --clans "#2JVQVYUYC" --out-json docs/data.json --snapshot clan_snapshot.json
           python clan_dashboard.py --snapshot clan_snapshot.json --out docs
+        working-directory: project
 
-      - name: Verify generated files
+      - name: Verify build
         run: |
           test -f docs/index.html
-          python - <<'EOF'
-          import json, sys
+          test -f docs/data.json
+          python - <<'PY'
+          import json
           d = json.load(open("docs/data.json", encoding="utf-8"))
-          clans = d.get("clans") or {}
-          if not any((c or {}).get("memberList") for c in clans.values()):
-              sys.exit("data.json tidak berisi anggota klan")
-          print("OK:", ", ".join((c or {}).get("name", "?") for c in clans.values()))
-          EOF
+          print("clans:", list((d.get("clans") or {}).keys()))
+          PY
+        working-directory: project
 
-      # ---------- Notifikasi Telegram: hanya hal penting ----------
-      # Status (agar tiap kejadian dikirim sekali) disimpan di notify_state.json
-      # dan ikut di-commit ke repo privat oleh langkah berikutnya.
-      # Run pertama hanya mencatat kondisi awal tanpa mengirim pesan.
-      - name: Telegram - notifikasi penting
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        continue-on-error: true
+      - name: Deploy to public Pages repo
+        if: ${{ secrets.TARGET_REPO_TOKEN != '' }}
+        env:
+          TARGET_REPO_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
         run: |
-          python - <<'EOF'
-          import json, os, urllib.parse, urllib.request
-          from datetime import datetime, timedelta, timezone
+          set -euxo pipefail
 
-          WIB = timezone(timedelta(hours=7))
-          STATE_FILE = "notify_state.json"
-          REMIND_AT = [7200, 1800]  # detik sebelum war berakhir
-          # kata kunci perubahan yang dianggap penting (sesuaikan dengan teks diffs kamu)
-          IMPORTANT = ("masuk", "keluar", "bergabung", "role", "naik th", "naik liga", "level klan")
+          rm -rf /tmp/coc-web
+          git clone "https://x-access-token:${TARGET_REPO_TOKEN}@github.com/${{ env.TARGET_REPO }}.git" /tmp/coc-web
 
-          def parse(v):
-              try:
-                  return datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-              except Exception:
-                  return None
-
-          def wib(v):
-              dt = parse(v or "")
-              return dt.astimezone(WIB).strftime("%d/%m %H:%M WIB") if dt else "-"
-
-          d = json.load(open("docs/data.json", encoding="utf-8"))
-          first_run = not os.path.exists(STATE_FILE)
-          state = {} if first_run else json.load(open(STATE_FILE, encoding="utf-8"))
-          state.setdefault("wars", {})
-          state.setdefault("last_diffs", {})
-          now = datetime.now(timezone.utc)
-          msgs = []
-
-          for key, c in (d.get("clans") or {}).items():
-              c = c or {}
-              name = c.get("name") or key
-              w = (d.get("wars") or {}).get(key) or {}
-              us, them = w.get("us") or {}, w.get("them") or {}
-              cur = {"state": w.get("state") or "none", "id": w.get("start") or "", "reminded": []}
-              prev = state["wars"].get(key)
-
-              if prev and cur["state"] != "none":
-                  changed = prev.get("state") != cur["state"] or prev.get("id") != cur["id"]
-                  if prev.get("id") == cur["id"]:
-                      cur["reminded"] = prev.get("reminded", [])
-                  if changed:
-                      lawan = them.get("name", "?")
-                      if cur["state"] == "preparation":
-                          msgs.append(f"⚔️ {name}: war baru vs {lawan}, mulai {wib(w.get('start'))}")
-                      elif cur["state"] == "inWar":
-                          msgs.append(f"🔥 {name}: war vs {lawan} dimulai, berakhir {wib(w.get('end'))}")
-                      elif cur["state"] == "warEnded":
-                          a, b = us.get("stars", 0), them.get("stars", 0)
-                          if a == b:
-                              da, db = us.get("destructionPercentage"), them.get("destructionPercentage")
-                              if da is not None and db is not None and da != db:
-                                  a, b = da, db
-                          hasil = "MENANG 🏆" if a > b else "KALAH 😞" if a < b else "SERI 🤝"
-                          msgs.append(f"{name}: war vs {lawan} selesai, {hasil} ({us.get('stars', 0)}★ vs {them.get('stars', 0)}★)")
-              elif prev and prev.get("id") == cur["id"]:
-                  cur["reminded"] = prev.get("reminded", [])
-
-              # pengingat serangan belum dipakai
-              end = parse(w.get("end") or "")
-              if prev and cur["state"] == "inWar" and end:
-                  remain = (end - now).total_seconds()
-                  due = [t for t in REMIND_AT if remain <= t and t not in cur["reminded"]]
-                  if due:
-                      per = w.get("attacksPerMember", 2)
-                      belum = []
-                      for m in us.get("members") or []:
-                          if "attacks" in m:
-                              sisa = per - len(m.get("attacks") or [])
-                              if sisa > 0:
-                                  belum.append(f"{m.get('name', '?')} ({sisa})")
-                      if belum:
-                          jam = int(remain // 3600)
-                          menit = int((remain % 3600) // 60)
-                          msgs.append(f"⏰ {name}: war berakhir {jam}j {menit}m lagi. Belum menyerang: " + ", ".join(belum[:15]))
-                      cur["reminded"] = sorted(set(cur["reminded"]) | {t for t in REMIND_AT if remain <= t})
-
-              state["wars"][key] = cur
-
-              # perubahan penting (hanya yang baru dibanding run sebelumnya)
-              diffs = ((d.get("meta") or {}).get(key) or {}).get("diffs") or []
-              diffs = [x for x in diffs if not x.startswith("Snapshot baru")]
-              baru = [x for x in diffs if x not in state["last_diffs"].get(key, [])]
-              penting = [x for x in baru if any(k in x.lower() for k in IMPORTANT)]
-              if penting and not first_run:
-                  msgs.append(f"📋 {name}:\n" + "\n".join("• " + x for x in penting[:8]))
-              state["last_diffs"][key] = diffs
-
-          if msgs and not first_run:
-              body = urllib.parse.urlencode({
-                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                  "text": "\n\n".join(msgs)[:4000],
-                  "disable_web_page_preview": "true",
-              }).encode()
-              url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
-              urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=20).read()
-
-          json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1, sort_keys=True)
-          print("Notifikasi terkirim:", len(msgs))
-          EOF
-
-      # State (snapshot + history + notifikasi) disimpan balik ke repo PRIVAT lewat token checkout.
-      - name: Save snapshot and history (private repo)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for f in clan_snapshot.json clan_history.jsonl notify_state.json; do
-            [ -f "$f" ] && git add "$f"
-          done
-          if git diff --cached --quiet; then
-            echo "Tidak ada perubahan state."
-          else
-            git commit -m "chore: update clan state [skip ci]"
-            ok=0
-            for i in 1 2 3; do
-              if git pull --rebase --autostash && git push; then ok=1; break; fi
-              echo "Percobaan $i gagal, mengulang..."
-              sleep 5
-            done
-            [ "$ok" = 1 ]
-          fi
-
-      - name: Deploy to cykside/coc-web
-        if: ${{ env.TARGET_REPO_TOKEN != '' }}
-        run: |
-          set -e
-          rm -rf /tmp/coc-web && mkdir -p /tmp/coc-web
-          git clone "https://x-access-token:${TARGET_REPO_TOKEN}@github.com/cykside/coc-web.git" /tmp/coc-web
           cd /tmp/coc-web
 
+          if git ls-remote --exit-code --heads origin "${{ env.TARGET_BRANCH }}" >/dev/null 2>&1; then
+            git checkout "${{ env.TARGET_BRANCH }}"
+          else
+            git checkout --orphan "${{ env.TARGET_BRANCH }}"
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git checkout gh-pages
-          else
-            git checkout --orphan gh-pages
-          fi
 
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
 
-          # "/." ikut menyalin file tersembunyi (.nojekyll)
-          cp -R "$GITHUB_WORKSPACE"/project/docs/. .
+          # copy isi folder docs ke root repo target
+          cp -R "${{ github.workspace }}/project/docs/." .
 
-          git add --all
+          ls -la
+          test -f index.html
+          test -f data.json
+
+          git add -A
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No change"
           else
-            git commit -m "Deploy dashboard from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
-            git push origin gh-pages
+            git commit -m "Deploy dashboard from ${{ github.repository }}@${{ github.sha }}"
+            git push origin "${{ env.TARGET_BRANCH }}"
           fi
-
-      # ---------- Notifikasi gagal / pulih ----------
-      - name: Telegram - failed (hanya kegagalan pertama)
-        if: ${{ failure() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/runs?status=completed&per_page=1" --jq '.workflow_runs[0].conclusion')
-          if [ "$prev" = "failure" ]; then
-            echo "Sudah diberi tahu pada kegagalan sebelumnya."
-            exit 0
-          fi
-          printf '%s\n' \
-            "❌ Workflow dashboard klan GAGAL" \
-            "Kemungkinan: API key/IP ditolak, tag klan salah, atau token repo kedaluwarsa." \
-            "Pesan berikutnya ditahan sampai berhasil lagi." \
-            "${RUN_URL}" > /tmp/tg_msg.txt
-          curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data-urlencode "text@/tmp/tg_msg.txt" \
-            -d "disable_web_page_preview=true" >/dev/null
-
-      - name: Telegram - pulih
-        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/runs?status=completed&per_page=1" --jq '.workflow_runs[0].conclusion')
-          if [ "$prev" = "failure" ]; then
-            curl -sS --fail-with-body -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-              --data-urlencode "text=✅ Dashboard klan berjalan normal lagi" \
-              -d "disable_notification=true" >/dev/null
-          fi
-
-      # Repo publik tanpa aktivitas ~60 hari: GitHub menonaktifkan jadwalnya. Karena commit state
-      # masuk ke repo PRIVAT, repo publik ini tidak punya aktivitas sendiri. Langkah ini mengaktifkan
-      # ulang workflow lewat API supaya jadwal tetap hidup.
-      - name: Keep schedule alive
-        if: ${{ always() }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # Memakai API langsung. `gh workflow enable` menolak workflow yang sudah aktif
-        # ("could not find any workflows named ...").
-        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/enable"

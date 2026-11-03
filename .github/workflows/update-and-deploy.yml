@@ -87,7 +87,7 @@ jobs:
           COC_API_BASE: ${{ vars.COC_API_BASE }}
           PLAYER_TAGS: ${{ secrets.PLAYER_TAGS }}   # opsional: hanya tag ini yang ditampilkan di tab Alat
         run: |
-          python coc_clan.py --once --clans "#280PQUC2Q" "#2QPP9VRUQ --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
+          python coc_clan.py --once --clans "#280PQUC2Q" "#2QPP9VRUQ" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
           python clan_dashboard.py --snapshot clan_snapshot.json --out docs
 
       - name: Verify generated files

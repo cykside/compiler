@@ -291,6 +291,37 @@ jobs:
           done
           [ "$ok" = 1 ]
 
+      # GitHub Pages kadang gagal menerbitkan (HTTP 500 "Failed to create deployment") walau push berhasil.
+      # Langkah ini menunggu run "pages build and deployment" untuk commit gh-pages yang baru dan, bila gagal,
+      # menjalankan ulang job yang gagal (maks. 3 percobaan per run). Butuh izin Actions (read dan write) pada
+      # repo coc-web untuk TARGET_REPO_TOKEN; tanpa izin itu langkah ini hanya mencatat pesan dan lewat.
+      - name: Pages watchdog (jalankan ulang bila deploy Pages gagal)
+        if: ${{ env.TARGET_REPO_TOKEN != '' }}
+        continue-on-error: true
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_TOKEN }}
+        run: |
+          REPO=cykside/coc-web
+          SHA=$(git ls-remote "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" refs/heads/gh-pages | cut -f1)
+          [ -n "$SHA" ] || { echo "Tidak bisa membaca gh-pages, dilewati."; exit 0; }
+          sleep 40
+          for i in 1 2 3 4 5; do
+            row=$(gh api "repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=1" \
+              --jq '.workflow_runs[0] // empty | "\(.id) \(.status) \(.conclusion // "-") \(.run_attempt)"') \
+              || { echo "Tidak bisa membaca run Pages (cek izin Actions token)."; exit 0; }
+            if [ -z "$row" ]; then echo "Run Pages belum muncul (cek $i)."; sleep 30; continue; fi
+            set -- $row
+            echo "Run Pages $1: status=$2 hasil=$3 percobaan=$4"
+            if [ "$2" = "completed" ] && [ "$3" = "success" ]; then echo "Pages terbit."; exit 0; fi
+            if [ "$2" = "completed" ]; then
+              if [ "$4" -ge 3 ]; then echo "Sudah 3 percobaan, berhenti."; exit 0; fi
+              gh api -X POST "repos/${REPO}/actions/runs/$1/rerun-failed-jobs" >/dev/null && echo "Dijalankan ulang."
+            fi
+            sleep 30
+          done
+          echo "Batas waktu pemeriksaan habis; run berikutnya akan menerbitkan ulang."
+
       # ---------- Notifikasi gagal / pulih ----------
       - name: Telegram - failed (hanya kegagalan pertama)
         if: ${{ failure() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
@@ -339,4 +370,3 @@ jobs:
         # Memakai API langsung. `gh workflow enable` menolak workflow yang sudah aktif
         # ("could not find any workflows named ...").
         run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/enable"
-        

@@ -250,35 +250,46 @@ jobs:
             [ "$ok" = 1 ]
           fi
 
+      # gh-pages dijadikan SATU commit yatim tiap deploy (force-push), jadi riwayat tidak menumpuk.
+      # Push diulang sampai 4 kali bila GitHub sedang error (mis. "Internal Server Error").
       - name: Deploy to cykside/coc-web
         if: ${{ env.TARGET_REPO_TOKEN != '' }}
         run: |
           set -e
+          URL="https://x-access-token:${TARGET_REPO_TOKEN}@github.com/cykside/coc-web.git"
           rm -rf /tmp/coc-web && mkdir -p /tmp/coc-web
-          git clone "https://x-access-token:${TARGET_REPO_TOKEN}@github.com/cykside/coc-web.git" /tmp/coc-web
-          cd /tmp/coc-web
 
+          # Ambil gh-pages terakhir (hanya 1 commit) untuk membandingkan isi.
+          if ! git clone --quiet --depth 1 --branch gh-pages "$URL" /tmp/coc-web 2>/dev/null; then
+            rm -rf /tmp/coc-web && mkdir -p /tmp/coc-web
+            git init -q -b gh-pages /tmp/coc-web
+            git -C /tmp/coc-web remote add origin "$URL"
+          fi
+          cd /tmp/coc-web
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git checkout gh-pages
-          else
-            git checkout --orphan gh-pages
-          fi
-
           find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
-
           # "/." ikut menyalin file tersembunyi (.nojekyll) dan subfolder assets/
           cp -R "$GITHUB_WORKSPACE"/project/docs/. .
-
           git add --all
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
-          else
-            git commit -m "Deploy dashboard from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
-            git push origin gh-pages
+            exit 0
           fi
+
+          # Satu commit yatim, lalu timpa gh-pages: riwayat tidak menumpuk.
+          git checkout -q --orphan gh-pages-new
+          git commit -q -m "Deploy dashboard from ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+
+          ok=0
+          for i in 1 2 3 4; do
+            if git push --force origin gh-pages-new:gh-pages; then ok=1; break; fi
+            echo "Push gagal (percobaan $i), mengulang..."
+            sleep $((i * 10))
+          done
+          [ "$ok" = 1 ]
 
       # ---------- Notifikasi gagal / pulih ----------
       - name: Telegram - failed (hanya kegagalan pertama)
@@ -328,3 +339,4 @@ jobs:
         # Memakai API langsung. `gh workflow enable` menolak workflow yang sudah aktif
         # ("could not find any workflows named ...").
         run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/update-and-deploy.yml/enable"
+        

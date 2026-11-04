@@ -90,6 +90,12 @@ jobs:
           python coc_clan.py --once --clans "#280PQUC2Q" "#2QPP9VRUQ" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
           python clan_dashboard.py --snapshot clan_snapshot.json --out docs
 
+      # Jadwal event dari blog resmi Supercell (tidak ada API kalender resmi). Bila gagal, events.json lama
+      # (yang ikut di-commit di langkah berikutnya) tetap dipakai, dan tab Jadwal menandai data usang.
+      - name: Update official event calendar
+        continue-on-error: true
+        run: python update_events.py --out docs/events.json
+
       - name: Verify generated files
         run: |
           test -f docs/index.html
@@ -230,6 +236,7 @@ jobs:
           for f in clan_snapshot.json clan_history.jsonl notify_state.json players_cache.json; do
             [ -f "$f" ] && git add "$f"
           done
+          if [ -f docs/events.json ]; then git add docs/events.json; fi
           if git diff --cached --quiet; then
             echo "Tidak ada perubahan state."
           else

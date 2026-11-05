@@ -3,7 +3,7 @@ name: Update Clan Dashboard
 # Letakkan file ini di REPO PUBLIK sebagai .github/workflows/update-and-deploy.yml
 # Kode proyek tetap di repo privat; repo publik hanya menjalankan Actions (menit gratis).
 #
-# Repo privat harus berisi: coc_clan.py, clan_dashboard.py, clan_dashboard_template_adv.html,
+# Repo privat harus berisi: coc_clan.py, clan_dashboard.py, notify_telegram.py, clan_dashboard_template_adv.html,
 # requirements.txt, dan folder assets/ (style.css, app.js, favicon, ikon, manifest).
 #
 # Secrets yang dibutuhkan di repo PUBLIK (Settings > Secrets and variables > Actions):
@@ -11,11 +11,17 @@ name: Update Clan Dashboard
 #   PLAYER_TAGS (opsional): tag pemain yang ditampilkan di tab Alat, dipisah koma, spasi, atau baris baru
 # Variable (opsional): COC_API_BASE
 #
-# Notifikasi Telegram hanya untuk hal penting:
-#   - war baru / war mulai / hasil war
-#   - pengingat 2 jam dan 30 menit sebelum war berakhir (yang belum menyerang)
-#   - perubahan penting klan (masuk/keluar/role/naik TH)
-#   - gagal (hanya kegagalan pertama dalam satu rentetan) dan pulih
+# Notifikasi Telegram (logika di notify_telegram.py, repo privat):
+#   - war biasa dan ronde CWL: baru / mulai / hasil + rekap; pengingat 2 jam dan 30 menit (belum menyerang)
+#   - CWL: awal musim, hasil tiap ronde, akhir musim dengan peringkat perkiraan
+#   - Capital Raid: pengingat serangan belum dipakai dan rekap hasil
+#   - event resmi Supercell (mulai / berakhir), perubahan penting klan (masuk/keluar/role/naik TH)
+#   - rekor: naik level klan, rentetan menang, rekor bintang; Legend League naik/turun dan musim hampir selesai
+#   - anggota tanpa donasi >= 14 hari atau tidak menyerang 3 war (sekali seminggu)
+#   - pemain ditandai: hero selesai upgrade, rush saat naik TH; kandidat dari watchlist.json masuk/keluar klan
+#   - ringkasan harian atau mingguan, jam tenang (pesan non-urgent tanpa bunyi), tombol ke tab dashboard
+#   - data gagal diambil / war log jadi privat, workflow gagal (hanya yang pertama) dan pulih
+# Secret opsional: TELEGRAM_CHAT_IDS. Variable opsional: NOTIFY_QUIET_HOURS, NOTIFY_SUMMARY, NOTIFY_SUMMARY_HOUR, DASHBOARD_URL.
 #
 # JANGAN tambahkan trigger pull_request / pull_request_target / issue_comment di workflow ini:
 # repo publik bisa dibuka siapa saja.
@@ -86,6 +92,9 @@ jobs:
           COC_API_KEY: ${{ secrets.COC_API_KEY }}
           COC_API_BASE: ${{ vars.COC_API_BASE }}
           PLAYER_TAGS: ${{ secrets.PLAYER_TAGS }}   # opsional: hanya tag ini yang ditampilkan di tab Alat
+          # Dikosongkan agar coc_clan.py tidak ikut mengirim alert sendiri; semua notifikasi lewat langkah Telegram di bawah.
+          TELEGRAM_BOT_TOKEN: ''
+          TELEGRAM_CHAT_ID: ''
         run: |
           python coc_clan.py --once --clans "#280PQUC2Q" "#2QPP9VRUQ" --purge-others --out-json docs/data.json --snapshot clan_snapshot.json
           python clan_dashboard.py --snapshot clan_snapshot.json --out docs
@@ -112,121 +121,23 @@ jobs:
           print("OK:", ", ".join((c or {}).get("name", "?") for c in clans.values()))
           EOF
 
-      # ---------- Notifikasi Telegram: hanya hal penting ----------
-      # Status (agar tiap kejadian dikirim sekali) disimpan di notify_state.json
-      # dan ikut di-commit ke repo privat oleh langkah berikutnya.
-      # Run pertama hanya mencatat kondisi awal tanpa mengirim pesan.
+      # ---------- Notifikasi Telegram ----------
+      # Logika ada di notify_telegram.py (repo privat, ada tes di tests/test_notify_telegram.py).
+      # Status agar tiap kejadian dikirim sekali disimpan di notify_state.json dan ikut di-commit
+      # ke repo privat oleh langkah berikutnya. Run pertama dan fitur yang baru ditambahkan hanya
+      # mencatat kondisi awal tanpa mengirim pesan.
       - name: Telegram - notifikasi penting
         if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         continue-on-error: true
-        run: |
-          python - <<'EOF'
-          import json, os, urllib.parse, urllib.request
-          from datetime import datetime, timedelta, timezone
+        env:
+          PLAYER_TAGS: ${{ secrets.PLAYER_TAGS }}                 # pemain ditandai (hero, rush)
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}     # opsional: chat per klan, "280PQUC2Q=-100111,2QPP9VRUQ=-100222"
+          NOTIFY_QUIET_HOURS: ${{ vars.NOTIFY_QUIET_HOURS }}      # opsional: jam tenang WIB, default 23-6, "off" = mati
+          NOTIFY_SUMMARY: ${{ vars.NOTIFY_SUMMARY }}              # opsional: daily (default) | weekly | off
+          NOTIFY_SUMMARY_HOUR: ${{ vars.NOTIFY_SUMMARY_HOUR }}    # opsional: jam kirim ringkasan WIB, default 20
+          DASHBOARD_URL: ${{ vars.DASHBOARD_URL }}                # opsional: default https://cykside.github.io/coc-web/
+        run: python notify_telegram.py
 
-          WIB = timezone(timedelta(hours=7))
-          STATE_FILE = "notify_state.json"
-          REMIND_AT = [7200, 1800]  # detik sebelum war berakhir
-
-          # Awalan diff yang ditulis coc_clan.py (diff_clan): JOIN, LEFT, ROLE, TH, DON, CAP.
-          # DON dan CAP terlalu sering, jadi tidak dinotifikasikan.
-          LABEL = {"JOIN": "➕ Masuk", "LEFT": "➖ Keluar", "ROLE": "🎖️ Role", "TH": "🏰 Naik TH"}
-          IMPORTANT = tuple(k + ":" for k in LABEL)
-
-          def fmt_diff(x):
-              k, _, rest = x.partition(":")
-              return f"{LABEL.get(k, k)}:{rest}"
-
-          def parse(v):
-              try:
-                  return datetime.strptime(v[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
-              except Exception:
-                  return None
-
-          def wib(v):
-              dt = parse(v or "")
-              return dt.astimezone(WIB).strftime("%d/%m %H:%M WIB") if dt else "-"
-
-          d = json.load(open("docs/data.json", encoding="utf-8"))
-          first_run = not os.path.exists(STATE_FILE)
-          state = {} if first_run else json.load(open(STATE_FILE, encoding="utf-8"))
-          state.setdefault("wars", {})
-          state.setdefault("last_diffs", {})
-          now = datetime.now(timezone.utc)
-          msgs = []
-
-          for key, c in (d.get("clans") or {}).items():
-              c = c or {}
-              name = c.get("name") or key
-              w = (d.get("wars") or {}).get(key) or {}
-              us, them = w.get("us") or {}, w.get("them") or {}
-              cur = {"state": w.get("state") or "none", "id": w.get("start") or "", "reminded": []}
-              prev = state["wars"].get(key)
-
-              if prev and cur["state"] != "none":
-                  changed = prev.get("state") != cur["state"] or prev.get("id") != cur["id"]
-                  if prev.get("id") == cur["id"]:
-                      cur["reminded"] = prev.get("reminded", [])
-                  if changed:
-                      lawan = them.get("name", "?")
-                      if cur["state"] == "preparation":
-                          msgs.append(f"⚔️ {name}: war baru vs {lawan}, mulai {wib(w.get('start'))}")
-                      elif cur["state"] == "inWar":
-                          msgs.append(f"🔥 {name}: war vs {lawan} dimulai, berakhir {wib(w.get('end'))}")
-                      elif cur["state"] == "warEnded":
-                          a, b = us.get("stars", 0), them.get("stars", 0)
-                          if a == b:
-                              # bintang sama: pemenang ditentukan persentase kerusakan (field "pct")
-                              da, db = us.get("pct"), them.get("pct")
-                              if da is not None and db is not None and da != db:
-                                  a, b = da, db
-                          hasil = "MENANG 🏆" if a > b else "KALAH 😞" if a < b else "SERI 🤝"
-                          msgs.append(f"{name}: war vs {lawan} selesai, {hasil} ({us.get('stars', 0)}★ vs {them.get('stars', 0)}★)")
-              elif prev and prev.get("id") == cur["id"]:
-                  cur["reminded"] = prev.get("reminded", [])
-
-              # pengingat serangan belum dipakai
-              end = parse(w.get("end") or "")
-              if prev and cur["state"] == "inWar" and end:
-                  remain = (end - now).total_seconds()
-                  due = [t for t in REMIND_AT if remain <= t and t not in cur["reminded"]]
-                  if due:
-                      per = w.get("perMember") or 2   # jatah serangan per anggota
-                      belum = []
-                      for m in us.get("members") or []:
-                          if "attacks" in m:
-                              sisa = per - len(m.get("attacks") or [])
-                              if sisa > 0:
-                                  belum.append(f"{m.get('name', '?')} ({sisa})")
-                      if belum:
-                          jam = int(remain // 3600)
-                          menit = int((remain % 3600) // 60)
-                          msgs.append(f"⏰ {name}: war berakhir {jam}j {menit}m lagi. Belum menyerang: " + ", ".join(belum[:15]))
-                      cur["reminded"] = sorted(set(cur["reminded"]) | {t for t in REMIND_AT if remain <= t})
-
-              state["wars"][key] = cur
-
-              # perubahan penting (hanya yang baru dibanding run sebelumnya)
-              diffs = ((d.get("meta") or {}).get(key) or {}).get("diffs") or []
-              diffs = [x for x in diffs if not x.startswith("Snapshot baru")]
-              baru = [x for x in diffs if x not in state["last_diffs"].get(key, [])]
-              penting = [x for x in baru if x.startswith(IMPORTANT)]
-              if penting and not first_run:
-                  msgs.append(f"📋 {name}:\n" + "\n".join("• " + fmt_diff(x) for x in penting[:8]))
-              state["last_diffs"][key] = diffs
-
-          if msgs and not first_run:
-              body = urllib.parse.urlencode({
-                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-                  "text": "\n\n".join(msgs)[:4000],
-                  "disable_web_page_preview": "true",
-              }).encode()
-              url = f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage"
-              urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=20).read()
-
-          json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1, sort_keys=True)
-          print("Notifikasi terkirim:", len(msgs))
-          EOF
 
       # State (snapshot + history + notifikasi) disimpan balik ke repo PRIVAT lewat token checkout.
       - name: Save snapshot and history (private repo)
